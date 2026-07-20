@@ -1,0 +1,91 @@
+name: SEO Audit FCT (quincenal)
+
+# Se ejecuta los días 1 y 16 de cada mes a las 06:00 UTC (~ cada 15 días).
+# Cron NO tiene un "cada 15 días" exacto; 1,16 es el idioma estándar más estable.
+# workflow_dispatch permite lanzarlo también a mano desde la pestaña Actions.
+on:
+  schedule:
+    - cron: "0 6 1,16 * *"
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL a auditar"
+        default: "https://www.farmaconsulting.es"
+        required: false
+
+permissions:
+  contents: write   # necesario para commitear el informe de vuelta al repo
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TARGET_URL: ${{ github.event.inputs.url || 'https://www.farmaconsulting.es' }}
+    steps:
+      - name: Checkout del fork
+        uses: actions/checkout@v4
+
+      - name: Instalar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar Claude Code (headless)
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Instalar skills/agents desde ESTE fork (no el upstream)
+        run: |
+          mkdir -p "$HOME/.claude/skills" "$HOME/.claude/agents"
+          cp -r skills/* "$HOME/.claude/skills/"
+          cp -r agents/*.md "$HOME/.claude/agents/" 2>/dev/null || true
+          # Dependencias Python de las skills
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+          # Playwright opcional para capturas
+          python3 -m pip install playwright && python3 -m playwright install --with-deps chromium || true
+
+      - name: Ejecutar auditoría SEO
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude -p "Ejecuta una auditoría SEO completa de ${TARGET_URL} usando la skill seo-audit. \
+          Crawlea el sitio, delega en los agentes especialistas, calcula el health score \
+          y genera FULL-AUDIT-REPORT.md, ACTION-PLAN.md y el PDF. \
+          Guarda todos los artefactos bajo el directorio de auditoría del dominio." \
+            --dangerously-skip-permissions \
+            --output-format text \
+            2>&1 | tee audit-run.log
+
+      - name: Ordenar informe por fecha
+        if: always()
+        run: |
+          STAMP=$(date +%Y-%m-%d)
+          DEST="reports/${STAMP}"
+          mkdir -p "$DEST"
+          # Los artefactos se generan en un dir "{dominio}-audit/"
+          find . -maxdepth 2 -type d -name "*-audit" -exec cp -r {} "$DEST/" \; 2>/dev/null || true
+          cp audit-run.log "$DEST/" 2>/dev/null || true
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+
+      - name: Subir informe como artifact (descargable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seo-audit-${{ env.STAMP }}
+          path: reports/
+          retention-days: 90
+
+      - name: Commitear informe al repo (opcional)
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/ || true
+          git commit -m "SEO audit ${STAMP}" || echo "Sin cambios que commitear"
+          git push || echo "Push omitido"
